@@ -32,6 +32,23 @@ name: CodeMender CI/CD Guardrail
 #     by the auth step. Proven against the real cm backend by
 #     .github/workflows/wif-auth-test.yml.
 #   * GITHUB_TOKEN    — built-in; used to open the remediation pull request.
+#
+# Resilience to transient Vertex AI errors (HTTP 429 / quota exhaustion):
+#   * "CodeMender Scan (cm find)" and each "cm fix" call retry a handful of
+#     times with exponential backoff (2s, 4s, 8s, ...) when the backend
+#     replies with a transient error such as 429 on
+#     aiplatform.googleapis.com/concurrent_interaction_generations. This is
+#     purely a retry, NOT a bypass: if every attempt still fails, the step
+#     (or, for a fix, that single finding) is left failed/unpatched, and the
+#     failure is allowed to propagate — it is never converted into a false
+#     success.
+#   * "Export Security Report (cm report -f json)" always writes a valid
+#     JSON file, even when `cm report` itself fails or returns garbage, so
+#     the codemender-report artifact stays downloadable. A fallback report
+#     is clearly marked "scan_status": "unavailable" and the step exits
+#     non-zero in that case, which skips "Triage Findings" (no `if:` guard)
+#     and makes the Security Gate fail CLOSED — a fallback report can never
+#     turn the gate green.
 # ---------------------------------------------------------------------------
 
 on:
@@ -195,15 +212,79 @@ jobs:
         run: |
           set -uo pipefail
           echo "Scanning '$SCAN_PATH' — files: $SCAN_FILES (in-scope source is uploaded to Google's CodeMender service)..."
-          cm find "$SCAN_PATH" -y 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
+          # Retry with exponential backoff: `cm find` calls the Vertex AI
+          # backend, which can transiently return HTTP 429 on a shared
+          # class-wide quota (aiplatform.googleapis.com/concurrent_interaction
+          # _generations). Retrying smooths over that WITHOUT masking a real,
+          # persistent failure: each attempt's full log is kept, and if every
+          # attempt still fails this step exits non-zero, which skips
+          # "Triage Findings" downstream and makes the Security Gate fail
+          # CLOSED (no scan evidence -> no deploy).
+          ATTEMPTS=5
+          n=0
+          until [ "$n" -ge "$ATTEMPTS" ]; do
+            n=$((n + 1))
+            echo "::group::cm find — attempt $n/$ATTEMPTS"
+            if cm find "$SCAN_PATH" -y 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            if grep -qiE '429|too many requests|resource[_ ]?exhausted|quota' "$RUNNER_TEMP/cm-find.cm.log"; then
+              REASON="transient error (HTTP 429 / Vertex AI quota exhaustion)"
+            else
+              REASON="cm find exited non-zero"
+            fi
+            if [ "$n" -ge "$ATTEMPTS" ]; then
+              echo "::error title=cm find failed::cm find failed after $ATTEMPTS attempt(s); last failure: $REASON. Not masking this — failing the step so the Security Gate blocks deployment (fail closed: no scan, no deploy)."
+              exit 1
+            fi
+            SLEEP=$(( 2 ** n ))
+            echo "::warning title=cm find retry::Attempt $n/$ATTEMPTS failed ($REASON). Retrying in ${SLEEP}s..."
+            sleep "$SLEEP"
+          done
 
       - name: Export Security Report (cm report -f json)
+        id: report
         if: ${{ always() && steps.scan.conclusion != 'skipped' }}
         run: |
           set -uo pipefail
-          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" 2> "$RUNNER_TEMP/cm-report.err" || true
+          REPORT="$RUNNER_TEMP/cm-security-report.json"
+          # Retry `cm report` too — it is a separate Vertex AI round-trip and
+          # can hit the same transient 429/quota error as `cm find`.
+          ATTEMPTS=3
+          n=0
+          ok=false
+          until [ "$n" -ge "$ATTEMPTS" ]; do
+            n=$((n + 1))
+            if cm report -f json > "$REPORT" 2> "$RUNNER_TEMP/cm-report.err" \
+               && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$REPORT" 2>/dev/null; then
+              ok=true
+              break
+            fi
+            echo "::warning title=cm report retry::cm report attempt $n/$ATTEMPTS failed or returned invalid JSON. stderr:"
+            cat "$RUNNER_TEMP/cm-report.err" 2>/dev/null || true
+            if [ "$n" -lt "$ATTEMPTS" ]; then
+              SLEEP=$(( 2 ** n ))
+              echo "Retrying cm report in ${SLEEP}s..."
+              sleep "$SLEEP"
+            fi
+          done
+          if [ "$ok" != "true" ]; then
+            # Fail-closed fallback: the artifact must stay downloadable and
+            # valid JSON (criterion below), but it must NEVER be mistaken for
+            # a clean scan. "scan_status": "unavailable" plus this step
+            # exiting 1 skips "Triage Findings" (no `if:` guard on it), so
+            # the Security Gate sees a non-success triage outcome and fails
+            # closed instead of reading an empty "findings" list as a pass.
+            echo "::error title=Security report unavailable::cm report failed or returned invalid JSON after $ATTEMPTS attempt(s) (possible 429/quota exhaustion). Writing a fallback report for the artifact, then failing this step so the Security Gate blocks deployment."
+            printf '%s\n' '{"findings": [], "scan_status": "unavailable", "error": "cm report failed or returned invalid JSON after retries -- see workflow logs (possible HTTP 429 / Vertex AI quota exhaustion)"}' > "$REPORT"
+            echo "----- fallback report written -----"
+            cat "$REPORT"
+            exit 1
+          fi
           echo "----- report (first 2 KB) -----"
-          head -c 2048 "$RUNNER_TEMP/cm-security-report.json" || true
+          head -c 2048 "$REPORT" || true
           echo
 
       - name: Upload Security Report
@@ -240,8 +321,37 @@ jobs:
             # --bypass-warning: cm 0.2.0's responsibility warning must be
             # acknowledged interactively once per machine; CI runners are
             # fresh every run, so the session dies before fixing without it.
-            ( cd "$SCAN_PATH" && cm fix "$FID" -y --bypass-warning ) 2>&1 \
-              | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            #
+            # Retry with exponential backoff: `cm fix` is another Vertex AI
+            # round-trip and can hit the same transient 429/quota error as
+            # `cm find`. If every attempt fails, this finding is simply left
+            # unpatched (the loop falls through to the "no clean diff"
+            # branch below) — that is not masked as success; the finding
+            # stays open for the Security Gate to catch on the next run.
+            FIX_ATTEMPTS=4
+            fn=0
+            fix_ok=false
+            until [ "$fn" -ge "$FIX_ATTEMPTS" ]; do
+              fn=$((fn + 1))
+              if ( cd "$SCAN_PATH" && cm fix "$FID" -y --bypass-warning ) 2>&1 \
+                   | tee "$RUNNER_TEMP/fix-$FID.cm.log"; then
+                fix_ok=true
+                break
+              fi
+              if grep -qiE '429|too many requests|resource[_ ]?exhausted|quota' "$RUNNER_TEMP/fix-$FID.cm.log"; then
+                FIX_REASON="transient error (HTTP 429 / Vertex AI quota exhaustion)"
+              else
+                FIX_REASON="cm fix exited non-zero"
+              fi
+              if [ "$fn" -ge "$FIX_ATTEMPTS" ]; then
+                echo "::warning title=cm fix retries exhausted::cm fix $FID failed after $FIX_ATTEMPTS attempt(s); last failure: $FIX_REASON. Leaving this finding unpatched instead of masking the failure."
+                break
+              fi
+              FIX_SLEEP=$(( 2 ** fn ))
+              echo "::warning title=cm fix retry::cm fix $FID attempt $fn/$FIX_ATTEMPTS failed ($FIX_REASON). Retrying in ${FIX_SLEEP}s..."
+              sleep "$FIX_SLEEP"
+            done
+            echo "cm fix $FID finished: fix_ok=$fix_ok"
             # Surface a path-resolution failure on its own — otherwise it is
             # indistinguishable from success in the "no clean diff" branch below.
             if grep -q "acquiring write lock" "$RUNNER_TEMP/fix-$FID.cm.log"; then
